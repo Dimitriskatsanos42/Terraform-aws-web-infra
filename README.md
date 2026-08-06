@@ -1,103 +1,113 @@
+# AWS Web Infrastructure with Terraform
 
-# Terraform Cloud Infrastructure Project
+Terraform setup που στήνει ένα βασικό αλλά ρεαλιστικό web infrastructure στο AWS: load balancer μπροστά, τα instances πίσω σε private subnets, auto scaling ανάλογα με το load, και ξεχωριστά περιβάλλοντα για dev και prod.
 
-Επαγγελματικό, **modular** Terraform project που στήνει web infrastructure στο AWS:
+Η ιδέα είναι να δείξει τον τυπικό τρόπο που στήνεται infrastructure σε production - modules, remote state, CI/CD - όχι ένα single-file demo.
 
-- **VPC** με public/private subnets σε 2 Availability Zones
-- **NAT Gateway** για internet access από τα private subnets
-- **Application Load Balancer** (public) που δρομολογεί traffic
-- **Auto Scaling Group** με EC2 instances (private subnets, ασφαλή)
-- **Remote state** στο S3 με locking μέσω DynamoDB
-- **CI/CD** με GitHub Actions: `plan` σε κάθε PR, `apply` αυτόματα στο `dev` όταν γίνεται merge στο `main`, και `apply` στο `prod` με manual approval
+## Πώς δουλεύει
 
-## Αρχιτεκτονική
+Το κάθε request περνάει πρώτα από ένα Application Load Balancer, το οποίο βρίσκεται σε public subnets. Το ALB προωθεί το traffic σε ένα Auto Scaling Group με EC2 instances, τα οποία ζουν σε private subnets - δεν έχουν δηλαδή δημόσια IP και δεν είναι προσβάσιμα απευθείας από το internet. Η μόνη τους έξοδος προς τα έξω (π.χ. για updates) γίνεται μέσω ενός NAT Gateway.
+
+Το Auto Scaling Group ανεβάζει ή κατεβάζει τον αριθμό των instances ανάλογα με το load, με min/max/desired capacity που ορίζονται ξεχωριστά ανά environment.
 
 ```
-Internet
-   │
-   ▼
-[ALB - public subnets] ──► [Target Group]
-                                 │
-                                 ▼
-                  [Auto Scaling Group - private subnets]
-                          EC2 instances (Apache)
-                                 │
-                                 ▼
-                          [NAT Gateway] ──► Internet (outbound only)
+                 Internet
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │   Load Balancer       │   (public subnets)
+        └───────────┬───────────┘
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │   Auto Scaling Group  │   (private subnets)
+        │   EC2 instances       │
+        └───────────┬───────────┘
+                    │
+                    ▼
+        ┌───────────────────────┐
+        │   NAT Gateway          │   (outbound only)
+        └───────────────────────┘
 ```
 
-## Δομή project
+## Δομή
 
 ```
-.
-├── modules/
-│   ├── vpc/       # VPC, subnets, routing, NAT
-│   ├── alb/       # Load Balancer, Target Group, listener
-│   └── ec2/       # Launch Template, Auto Scaling Group
-├── environments/
-│   ├── dev/       # μικρό sizing, δικό του state
-│   └── prod/      # μεγαλύτερο sizing, δικό του state
-├── bootstrap/
-│   └── bootstrap.sh   # δημιουργεί το S3 bucket + DynamoDB table για state
-└── .github/workflows/
-    └── terraform.yml  # CI/CD pipeline
+modules/
+  vpc/       networking - subnets, routing, NAT gateway
+  alb/       load balancer, target group, security group
+  ec2/       launch template + auto scaling group
+
+environments/
+  dev/       μικρό sizing, δικό του state file
+  prod/      μεγαλύτερο sizing, δικό του state file
+
+bootstrap/
+  bootstrap.sh   δημιουργεί το S3 bucket και το DynamoDB table που χρειάζεται το remote state
+  oidc/          δημιουργεί τον IAM role που χρησιμοποιεί το GitHub Actions αντί για access keys
+
+.github/workflows/
+  terraform.yml  CI/CD pipeline
 ```
 
-## Προαπαιτούμενα
+Τα modules είναι ξεχωριστά κομμάτια που μπορούν να επαναχρησιμοποιηθούν - το `environments/dev` και το `environments/prod` απλά τα καλούν με διαφορετικές παραμέτρους (μέγεθος VPC, αριθμό instances κλπ).
 
-- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
-- [AWS CLI](https://aws.amazon.com/cli/) ρυθμισμένο (`aws configure`)
-- Λογαριασμός AWS με δικαιώματα να δημιουργεί VPC/EC2/ALB/S3/DynamoDB
+## Remote state
 
-## Βήμα 1: Bootstrap remote state (μία φορά)
+Το state δεν κρατιέται τοπικά, πάει σε S3 bucket με locking μέσω DynamoDB, ώστε να μπορεί να δουλέψει πάνω του πάνω από ένας άνθρωπος (ή το CI) χωρίς conflicts. Το bucket και το table φτιάχνονται μία φορά με το `bootstrap/bootstrap.sh`.
+
+## Τρέξιμο τοπικά
+
+Χρειάζεται Terraform >= 1.5 και AWS CLI ρυθμισμένο.
 
 ```bash
+# μία φορά, δημιουργεί το backend για το state
 cd bootstrap
-chmod +x bootstrap.sh
-./bootstrap.sh myapp-terraform-state-<κάτι-μοναδικό> eu-central-1
-```
+./bootstrap.sh <όνομα-bucket> eu-central-1
 
-Μετά, ενημέρωσε το `bucket` στα:
-- `environments/dev/backend.tf`
-- `environments/prod/backend.tf`
+# μετά ενημέρωσε το bucket name στα environments/dev/backend.tf
+# και environments/prod/backend.tf
 
-## Βήμα 2: Τοπική εκτέλεση (dev)
-
-```bash
-cd environments/dev
+cd ../environments/dev
 terraform init
 terraform plan
 terraform apply
 ```
 
-Στο τέλος θα πάρεις `alb_dns_name` — αυτό είναι το URL του website σου.
+Στο output θα εμφανιστεί το DNS name του load balancer - αυτό είναι το URL της εφαρμογής.
 
-## Βήμα 3: Καθαρισμός (για να μη χρεώνεσαι)
+Για να αφαιρέσεις τα πάντα:
 
 ```bash
 terraform destroy
 ```
 
-## CI/CD με GitHub Actions
+## CI/CD
 
-1. Ανέβασε το repo στο GitHub.
-2. Πήγαινε στο **Settings → Secrets and variables → Actions** και πρόσθεσε:
-   - `AWS_ACCESS_KEY_ID`
-   - `AWS_SECRET_ACCESS_KEY`
-3. (Προαιρετικά αλλά συνιστάται) Στο **Settings → Environments**, δημιούργησε environment `prod` και βάλε "Required reviewers" ώστε το `apply` στο prod να χρειάζεται manual approval.
-4. Κάθε Pull Request θα τρέχει αυτόματα `terraform plan`.
-5. Κάθε merge στο `main` θα κάνει `apply` στο dev, και μετά (με approval) στο prod.
+Το workflow κάνει `terraform plan` σε κάθε pull request, και `apply` αυτόματα στο dev όταν γίνεται merge στο main. Το prod environment έχει ξεχωριστό job που τρέχει μετά, και μπορεί να ρυθμιστεί ώστε να χρειάζεται manual approval πριν προχωρήσει (μέσω GitHub Environments με required reviewers).
 
-## Σημαντικές σημειώσεις ασφαλείας
+Η σύνδεση με το AWS γίνεται μέσω **OIDC federation**, όχι με static access keys. Το GitHub Actions παίρνει προσωρινό token σε κάθε run και υποδύεται έναν IAM role - δεν αποθηκεύεται κανένα μόνιμο credential πουθενά.
 
-- Ποτέ μην κάνεις commit `.tfstate` ή `.tfvars` με μυστικά (καλύπτεται από `.gitignore`).
-- Χρησιμοποίησε IAM user με το ελάχιστο δυνατό δικαίωμα (least privilege), όχι root credentials.
-- Σκέψου να χρησιμοποιήσεις [OIDC federation](https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services) αντί για static AWS keys στο GitHub Actions, για ακόμα καλύτερη ασφάλεια.
+Setup (μία φορά):
 
-## Επόμενα βήματα / ιδέες επέκτασης
+```bash
+cd bootstrap/oidc
+terraform init
+terraform apply \
+  -var="github_org=<το-github-username-σου>" \
+  -var="github_repo=aws-vpc-alb-autoscaling-terraform"
+```
 
-- HTTPS με ACM certificate + Route53 domain
-- WAF μπροστά από το ALB
-- CloudWatch alarms + SNS notifications
-- Terraform Cloud/Terragrunt για ακόμα καλύτερο περιβαλλοντικό management
-- Containerized deployment (ECS/Fargate) αντί για EC2
+Το output θα δώσει ένα `role_arn`. Αυτό πάει στο repository ως **variable** (όχι secret, αφού δεν είναι sensitive):
+
+Settings → Secrets and variables → Actions → tab "Variables" → New repository variable
+- Name: `AWS_ROLE_ARN`
+- Value: το arn που πήρες
+
+Αυτό είναι το μόνο που χρειάζεται - δεν υπάρχουν access keys να διαχειριστείς ή να κάνεις rotate.
+
+## Σημειώσεις
+
+- Τα state files και τα tfvars δεν ανεβαίνουν στο repo (βλέπε `.gitignore`) - μπορεί να περιέχουν sensitive δεδομένα.
+- Το CI/CD δεν χρησιμοποιεί static AWS keys, μόνο OIDC role assumption (βλέπε `bootstrap/oidc`). Ο role είναι περιορισμένος ώστε να μπορεί να τον πάρει μόνο workflow από το συγκεκριμένο repo.
+- Τα permissions στο `bootstrap/oidc/main.tf` είναι αρκετά ανοιχτά (full access σε EC2/VPC/ELB/ASG/S3/DynamoDB/IAM) για να δουλέψει άμεσα το project. Σε πραγματικό production θα τα περιόριζες περαιτέρω σε συγκεκριμένα resources/ARNs.
